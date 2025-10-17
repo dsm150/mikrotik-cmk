@@ -1,4 +1,266 @@
+
+---
+
+## 🧩 agents/special/agent_mikrotik
+
+> Это та самая версия с WAN-пингами по интерфейсу и агрегированным `wan_overall`.
+
+```python
 #!/usr/bin/env python3
-# (truncated code for brevity in this snippet)
-print("AgentOS: RouterOS-via-API")
-# ...
+# -*- coding: utf-8 -*-
+"""
+MikroTik special agent for Checkmk (CRE)
+- Classic API (8728) via librouteros
+- Local checks for CPU/MEM/Interfaces
+- WAN checks via /tool/ping interface=<iface> address=<target> (ROS 7.x)
+- Aggregated check: wan_overall (CRIT if only LastChanceGW is up)
+"""
+
+import sys, argparse, statistics, re
+sys.path.insert(0, "/omd/sites/monitoring/local/lib/python3")
+
+from librouteros import connect
+from librouteros.login import plain as login_plain
+
+# ---------- utils ----------
+local_lines = []
+
+def local(metric: str, state: int, msg: str, perf: str | None = None) -> None:
+    line = f"{state} {metric} - {msg}"
+    if perf:
+        line += f" | {perf}"
+    local_lines.append(line)
+
+def flush_local_section() -> None:
+    if not local_lines:
+        return
+    print("<<<local>>>")
+    for line in local_lines:
+        print(line)
+
+def parse_if_map(s: str) -> dict[str, str]:
+    m = {}
+    if not s:
+        return m
+    for pair in s.split(","):
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            m[k.strip()] = v.strip()
+    return m
+
+_ms_us_re = re.compile(r"^(?:(?P<sec>\d+)s)?(?:(?P<ms>\d+)ms)?(?:(?P<us>\d+)us)?$")
+_hms_re   = re.compile(r"^(?P<h>\d+):(?P<m>\d+):(?P<s>\d+(?:\.\d+)?)$")
+
+def to_float_ms(v) -> float | None:
+    """Convert RouterOS time strings to milliseconds."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    try:
+        m = _hms_re.match(s)
+        if m:
+            total_ms = (int(m["h"])*3600 + int(m["m"])*60) * 1000 + float(m["s"])*1000
+            return total_ms
+        m = _ms_us_re.match(s)
+        if m:
+            sec = int(m["sec"] or 0)
+            ms  = int(m["ms"] or 0)
+            us  = int(m["us"] or 0)
+            return float(sec*1000 + ms + us/1000.0)
+        if s.endswith("ms"):
+            return float(s[:-2])
+        if s.endswith("s"):
+            return float(s[:-1]) * 1000.0
+        return float(s)
+    except Exception:
+        return None
+
+# ---------- main ----------
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="MikroTik agent (API 8728) with WAN checks via /tool/ping interface=…",
+        add_help=False,
+    )
+    p.add_argument("--host")
+    p.add_argument("--user")
+    p.add_argument("--password")
+    p.add_argument("--timeout", type=int, default=8)
+    p.add_argument("--if_filter", default="")
+    # WAN settings
+    p.add_argument("--wan_comments", default="MainGW,RsrvGW,LastChanceGW")
+    p.add_argument("--wan_if_map",
+                   default="MainGW=ether7-Infolink,RsrvGW=pppoe-out-Flex,LastChanceGW=ether10-LTE")
+    p.add_argument("--ping_target", default="77.88.8.8")
+    p.add_argument("--ping_count", type=int, default=3)
+    p.add_argument("--rta_warn", type=float, default=500.0)
+    p.add_argument("--rta_crit", type=float, default=1500.0)
+    p.add_argument("--loss_crit", type=float, default=100.0)
+    # tolerated extras from Checkmk
+    p.add_argument("--hostname"); p.add_argument("--ipaddress")
+    p.add_argument("--debug", action="store_true"); p.add_argument("--logfile")
+    p.add_argument("host_positional", nargs="?", default=None)
+
+    args, unknown = p.parse_known_args()
+    if not args.host and args.host_positional:
+        args.host = args.host_positional
+    if not args.host or not args.user or not args.password:
+        local("mikrotik_arguments", 2, "Missing required args: --host/--user/--password")
+        flush_local_section(); return
+
+    print("<<<check_mk>>>")
+    print("AgentOS: RouterOS-via-API\n")
+
+    # connect
+    try:
+        api = connect(username=args.user, password=args.password,
+                      host=args.host, login_method=login_plain,
+                      timeout=args.timeout)
+    except Exception as e:
+        local("mikrotik_connection", 2, f"Connect failed: {e}")
+        flush_local_section(); return
+
+    # ----- system -----
+    print("<<<mikrotik_system:sep(124)>>>")
+    try:
+        for r in api(cmd="/system/resource/print"):
+            uptime = r.get("uptime", "")
+            cpu = int(r.get("cpu-load", 0))
+            free = int(r.get("free-memory", 0))
+            total = int(r.get("total-memory", 0))
+            print(f"uptime|{uptime}|cpu|{cpu}|free_mem|{free}|total_mem|{total}")
+            cpu_state = 0 if cpu < 70 else (1 if cpu < 90 else 2)
+            local("mikrotik_cpu_load", cpu_state, f"CPU {cpu}%", f"load={cpu};70;90;0;100")
+            if total > 0:
+                used = total - free
+                used_pct = int((used * 100) / total)
+                mem_state = 0 if used_pct < 80 else (1 if used_pct < 90 else 2)
+                local("mikrotik_mem_used", mem_state,
+                      f"Mem {used_pct}% ({used}/{total})",
+                      f"mem_used={used_pct}%;80;90;0;100")
+    except Exception as e:
+        local("mikrotik_system", 1, f"/system/resource/print failed: {e}")
+
+    # ----- health -----
+    print("<<<mikrotik_health:sep(124)>>>")
+    try:
+        for h in api(cmd="/system/health/print"):
+            print(f"voltage|{h.get('voltage','')}|temperature|{h.get('temperature','')}")
+            try:
+                t = int(float(h.get("temperature", "")))
+                t_state = 0 if t < 70 else (1 if t < 80 else 2)
+                local("mikrotik_temp", t_state, f"Temp {t}C", f"temp={t};70;80;0;120")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # ----- interfaces -----
+    print("<<<mikrotik_interfaces:sep(124)>>>")
+    try:
+        filt = [x.strip() for x in args.if_filter.split(",") if x.strip()]
+        for i in api(cmd="/interface/print"):
+            name = i.get("name", "")
+            if filt and not any(f in name for f in filt):
+                continue
+            rx = i.get("rx-byte", "0"); tx = i.get("tx-byte", "0")
+            running = str(i.get("running", "false")).lower() == "true"
+            disabled = str(i.get("disabled", "false")).lower() == "true"
+            print(f"{name}|{rx}|{tx}|{running}|{disabled}")
+            if disabled:
+                local(f"if_{name}_state", 1, "disabled")
+            else:
+                local(f"if_{name}_state", 0 if running else 2, f"running={running}")
+    except Exception as e:
+        local("mikrotik_interfaces", 1, f"/interface/print failed: {e}")
+
+    # ----- WAN checks -----
+    print("<<<mikrotik_wan:sep(124)>>>")
+    wantags = [x.strip() for x in args.wan_comments.split(",") if x.strip()]
+    ifmap = parse_if_map(args.wan_if_map)
+    up_map = {}
+
+    for tag in wantags:
+        iface = ifmap.get(tag, "")
+        if not iface:
+            local(f"wan_{tag}", 2, f"interface mapping missing for {tag}")
+            print(f"{tag}|{iface}|{args.ping_target}|||||")
+            up_map[tag] = False
+            continue
+
+        ok_rtt = []
+        sent = args.ping_count
+        summary = None
+        try:
+            replies = list(api(cmd="/tool/ping",
+                               **{"as-value":"", "interface": iface,
+                                  "address": args.ping_target, "count": sent}))
+            for rep in replies:
+                if "time" in rep:
+                    ms = to_float_ms(rep.get("time"))
+                    if ms is not None: ok_rtt.append(ms)
+                else:
+                    summary = rep
+        except Exception:
+            pass
+
+        recv = len(ok_rtt)
+        loss = float((sent - recv) * 100.0 / sent) if sent > 0 else 100.0
+        rta  = statistics.mean(ok_rtt) if ok_rtt else None
+
+        if rta is None and summary:
+            rta = to_float_ms(summary.get("avg-rtt"))
+            try:
+                loss_s = summary.get("packet-loss")
+                loss = float(str(loss_s).rstrip("%")) if loss_s is not None else loss
+                recv = int(summary.get("received", recv))
+            except Exception:
+                pass
+
+        up_map[tag] = recv > 0
+
+        state = 0
+        reasons = []
+        if loss >= args.loss_crit:
+            state = 2; reasons.append(f"loss {loss:.0f}%")
+        elif rta is not None:
+            if rta >= args.rta_crit:
+                state = 2; reasons.append(f"rta {rta:.0f}ms>=crit")
+            elif rta >= args.rta_warn:
+                state = 1; reasons.append(f"rta {rta:.0f}ms>=warn")
+
+        msg = [f"iface={iface}", f"dst={args.ping_target}",
+               f"sent={sent}", f"recv={recv}"]
+        if rta is not None:
+            perf = f"rta={rta:.0f};{args.rta_warn};{args.rta_crit};0;; pl={loss:.0f}%;0;{args.loss_crit};0;100"
+            msg += [f"rta={rta:.0f}ms", f"pl={loss:.0f}%"]
+        else:
+            perf = f"pl={loss:.0f}%;0;{args.loss_crit};0;100"
+            msg.append(f"pl={loss:.0f}%")
+        if reasons:
+            msg.append("(" + ", ".join(reasons) + ")")
+
+        print(f"{tag}|{iface}|{args.ping_target}|{sent}|{recv}|{int(rta) if rta else ''}|{int(loss)}")
+        local(f"wan_{tag}", state, " ".join(msg), perf)
+
+    # ----- aggregated wan_overall -----
+    main_up = up_map.get("MainGW", False)
+    rsrv_up = up_map.get("RsrvGW", False)
+    last_up = up_map.get("LastChanceGW", False)
+    up_count = int(main_up) + int(rsrv_up) + int(last_up)
+
+    if last_up and not main_up and not rsrv_up:
+        state = 2
+        reason = "Only LastChanceGW is UP"
+    else:
+        state = 0
+        reason = "UP:" + ",".join(
+            [t for t, u in (("MainGW", main_up),
+                            ("RsrvGW", rsrv_up),
+                            ("LastChanceGW", last_up)) if u] or ["none"]
+        )
+
+    local("wan_overall", state, reason, f"up_links={up_count};;;0;3")
+    flush_local_section()
+
+if __name__ == "__main__":
+    main()
