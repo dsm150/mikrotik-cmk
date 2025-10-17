@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+# (truncated code for brevity in this snippet)
+print("AgentOS: RouterOS-via-API")
+# ...
